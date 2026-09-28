@@ -1,0 +1,189 @@
+#' Adversarial random forests for omics synthesis
+#'
+#' This function uses a high-dimensional ARF model to generate synthetic data.
+#'
+#' @param harf_obj A pre-trained harf model.
+#' @param n_synth Number of synthetic samples to generate.
+#' @param evidence Optional set of conditioning events. This will be further passed
+#' to the \code{forde} function in each isolated regions. See \code{forde} for details.
+#' @param omx_onset_data Optional data.frame of conditional onset omics features.
+#' @param evidence_row_mode Interpretation of rows in multi-row evidence.
+#' See \code{forde} for details.
+#' @param round Round continuous variables to their respective maximum precision
+#' in the real data set? See \code{forde} for details.
+#' @param sample_NAs Sample NAs respecting the probability for missing values in
+#'  the original data? See \code{forde} for details.
+#' @param nomatch What to do if no leaf matches a condition in evidence?
+#' Options are to force sampling from a random leaf ("force") or return NA ("na").
+#'  The default is "force".
+#' @param verbose What to do if no leaf matches a condition in \code{evidence}?
+#' See \code{forde} for details.
+#' @param stepsize How many rows of evidence should be handled at each step?
+#' See \code{forde} for details.
+#' @param parallel Compute in parallel? See \code{forde} for details.
+#'
+#' @returns A data.table containing the generated synthetic omics data.
+#' @importFrom foreach foreach %do% %dopar%
+#' @seealso \code{\link[arf]{forge}} for details on the forging process.
+#' @references
+#' \itemize{
+#'   \item Watson et al. (2023). Adversarial Random Forests.
+#'   Proceedings of the International Conference on Machine Learning (PMLR 206).
+#'   <https://proceedings.mlr.press/v206/watson23a.html>
+#'
+#'   \item Fouodo et al. (2026). Adversarial random forests for omics synthesis.
+#'   bioRxiv preprint \doi{10.64898/2026.09.09.750490}
+#' }
+#' @export
+#' @author Césaire Fouodo
+#' @examples
+#' \donttest{
+#' data(single_cell)
+#' harf_model <- h_arf(
+#'   omx_data = single_cell[ , - which(colnames(single_cell)  == "cell_type")],
+#'   cli_lab_data = data.frame(cell_type = single_cell$cell_type)
+#' )
+#' # Unconditional sampling from harf_model
+#' set.seed(123)
+#' synth_single_cell <- h_forge(
+#'  harf_obj = harf_model,
+#'  n_synth = nrow(single_cell)
+#'  )
+#'  # Conditional resampling from harf_model
+#'  set.seed(142)
+#'  lung_single_cell <- h_forge(
+#'      harf_obj = harf_model,
+#'      n_synth = sum(single_cell$cell_type == "lung"),
+#'      evidence = data.frame(cell_type = "lung")
+#'     )
+#' }
+h_forge <- function (
+    harf_obj,
+    n_synth,
+    evidence = NULL,
+    omx_onset_data = NULL,
+    evidence_row_mode = c("separate", "or"),
+    round = TRUE,
+    sample_NAs = FALSE,
+    nomatch = c("force", "na"),
+    verbose = TRUE,
+    stepsize = 0,
+    parallel = FALSE
+) {
+  if (!inherits(harf_obj, "harf")) {
+    stop("harf_obj must be an object of class 'harf'.")
+  }
+  if (!is.numeric(n_synth) | n_synth <= 0 | n_synth != round(n_synth)) {
+    stop("n_synth must be a positive integer.")
+  }
+  # Extract those evidence columns that are in clinical/lab meta data
+  if (!is.null(evidence)) {
+    if (any(colnames(evidence) %in% c(unique(harf_obj$meta_model$meta_forde$cnt$variable),
+                                      unique(harf_obj$meta_model$meta_forde$cat$variable)))) {
+      meta_evidence <- evidence[ , colnames(evidence) %in% c(unique(harf_obj$meta_model$meta_forde$cnt$variable),
+                                                             unique(harf_obj$meta_model$meta_forde$cat$variable)), drop = FALSE]
+    } else {
+      meta_evidence <- NULL
+    }
+  } else {
+    meta_evidence <- NULL
+  }
+  # Retrieve meta_model from harf_obj
+  meta_model <- harf_obj$meta_model
+  # Retrieve the omx_onset_pcs from harf_obj if omx_onset_data is provided
+  if (!is.null(omx_onset_data)) {
+    if (!is.null(evidence)) {
+      if (nrow(evidence) != nrow(omx_onset_data)) {
+        stop("Number of rows in evidence must match number of rows in omx_onset_data.")
+      }
+    }
+    onset_loadings <- meta_model$onset_loadings
+    if (!is.null(onset_loadings)) {
+      # Projection of onset features onto pcs
+      if (ncol(omx_onset_data) != nrow(onset_loadings)) {
+        stop("Number of columns in omx_onset_data must match number of rows in onset_loadings.")
+      }
+      onset_features <- as.data.frame(
+        crossprod(t(as.matrix(omx_onset_data)), as.matrix(onset_loadings))
+      )
+      # Update meta_evidence
+      if (is.null(meta_evidence)) {
+        meta_evidence <- onset_features
+      } else {
+        meta_evidence <- data.frame(meta_evidence,
+                                    onset_features)
+      }
+    } else {
+      stop("onset_loadings not found in harf_obj object.")
+    }
+  }
+  # Forge meta data
+  meta_data <- arf::forge(
+    params = meta_model$meta_forde,
+    n_synth = n_synth,
+    evidence = meta_evidence,
+    evidence_row_mode = evidence_row_mode,
+    round = round,
+    sample_NAs = sample_NAs,
+    nomatch = nomatch,
+    verbose = verbose,
+    stepsize = stepsize,
+    parallel = FALSE
+  )
+  # For the remaining clusters, generate synthetic data conditioned on the current evidence
+  synth_omx <- function (mdl_idx) {
+    if (verbose) {
+      message(paste0("Generating synthetic data for cluster ", mdl_idx, " out of ", length(harf_obj$models), "..."))
+    }
+    synth_data <- arf::forge(
+      params = harf_obj$models[[mdl_idx]]$iso_forde,
+      n_synth = 1, # Always equals to 1 since we include evidence; nrow(evidence) == n_synth.
+      evidence = meta_data,
+      evidence_row_mode = evidence_row_mode,
+      round = round,
+      sample_NAs = sample_NAs,
+      nomatch = nomatch,
+      verbose = verbose,
+      stepsize = stepsize,
+      parallel = FALSE
+    )
+    # Dataset to be kept
+    synth_data <- synth_data[ , harf_obj$models[[mdl_idx]]$ftr_in_cluster, drop = FALSE]
+    return(synth_data)
+  }
+
+  # Parallelize with forech if requested
+  i <- NULL
+  if (isTRUE(parallel)) {
+    synth_omx_data_list <- foreach::foreach(i = 1:length(harf_obj$models),
+                                            .packages = "arf") %dopar% {
+                                              synth_omx(i)
+                                            }
+  } else {
+    synth_omx_data_list <- foreach::foreach(i = 1:length(harf_obj$models),
+                                            .packages = "arf") %do% {
+                                              synth_omx(i)
+                                            }
+  }
+  # Combine all synthetic omics data
+  synth_omx_data <- do.call(cbind, synth_omx_data_list)
+  # Also include constant features if they exist in the original data
+  if (!is.null(harf_obj$omx_constant_data)) {
+    constant_data <- do.call("rbind", lapply(1:n_synth, function(x) harf_obj$omx_constant_data))
+    synth_omx_data <- cbind(synth_omx_data, constant_data)
+  } else {
+    NULL
+  }
+  if (!is.null(harf_obj$cli_lab_feature)) {
+    synth_data <- data.table::data.table(synth_omx_data,
+                                         meta_data[ , harf_obj$cli_lab_feature,
+                                                    drop = FALSE])
+  } else {
+    synth_data <- data.table::data.table(synth_omx_data)
+  }
+  # re-order features if required
+  if (!is.null(harf_obj$feature_ordering)) {
+    data.table::setcolorder(synth_data,harf_obj$feature_ordering)
+  }
+  return(synth_data)
+}
